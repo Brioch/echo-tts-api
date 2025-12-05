@@ -6,3 +6,4 @@ venv/
 .env
 .idea/
 .vscode/
+api_generation.wav

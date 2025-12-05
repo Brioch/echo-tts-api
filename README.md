@@ -1,5 +1,41 @@
 # Echo-TTS
 
+> Fork: Echo TTS Streaming API — adds a FastAPI server in `api_server.py` that serves `/v1/audio/speech` with streaming PCM output. It keeps upstream behavior but layers chunked text handling, configurable sampling defaults, and runtime switches via `ECHO_*` env vars.
+
+## Echo TTS Streaming API
+- Run: `python api_server.py` (uses `PORT` env var, default `8000`; FastAPI lifespan loads models and optional compile caches).
+- Endpoint: `POST /v1/audio/speech` with body fields:
+  - `input` (text), `voice` (name of a prompt file or folder under `audio_prompts/`; accepts explicit filenames/extensions, base64-encoded audio, or directory names when folder support is on; folders are concatenated—per file with 1s gaps—before encoding), `stream` (bool, default true), `seed`, `extra_body` (sampler overrides such as `block_sizes`, `num_steps`, `chunking_enabled`, `chunk_target_seconds`, etc.).
+- Streaming responses emit raw PCM bytes with header `X-Audio-Sample-Rate: 44100`. Non-stream returns a single chunk.
+- Chunking: enabled by default; long text is split into timed chunks (target 30s, min 20s, max 40s) based on chars/word per second heuristics. Each chunk is synthesized separately and streamed in order; secondary chunks default to the non-stream block shape unless overridden.
+- Streaming defaults: `DEFAULT_BLOCK_SIZES = [32, 128, 480]` and `DEFAULT_NUM_STEPS = [8, 15, 20]` are tuned for real-time streaming with low TTFB (~200–300ms on a 3090 when compiled).
+- Voices: accepts single prompt files or whole folders (if enabled) under `audio_prompts/`; base64 voices are also supported.
+- Debug: when enabled, last generation is saved to `api_generation.wav`.
+- Example (streaming PCM, voice `expresso_02_ex03-ex01_calm_005`):
+```bash
+curl -X POST http://localhost:8000/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  --output out.pcm \
+  -d '{
+    "input": "[S1] Hello, this is Echo TTS streaming.",
+    "voice": "expresso_02_ex03-ex01_calm_005",
+    "stream": true,
+    "seed": 0,
+    "extra_body": {}
+  }'
+```
+
+### Server Environment Flags
+- `ECHO_MODEL_REPO` (default `jordand/echo-tts-base`) selects the main model; `ECHO_FISH_REPO` (default `jordand/fish-s1-dac-min`) selects the decoder.
+- `ECHO_DEVICE` / `ECHO_FISH_DEVICE` (default `cuda`) pick devices; set to `cpu` to avoid GPU requirements. `ECHO_MODEL_DTYPE` (default `bfloat16`) and `ECHO_FISH_DTYPE` (default `float32`) control dtypes.
+- `ECHO_COMPILE` (default `0`) toggles `torch.compile` for the main model; `ECHO_COMPILE_AE` (default `1`) separately compiles the decoder; `ECHO_COMPILE_LORA_ONLY` is ignored when LoRA is unused.
+- Cache/logging: `ECHO_CACHE_DIR` (default `/tmp`) and `ECHO_CACHE_VERSION` label saved compile artifacts; `ECHO_CACHE_SPEAKER_ON_GPU` (default `0`) caches speaker latents per device; `ECHO_DEBUG_LOGS` (default `0`) enables verbose timing/debug prints.
+- Chunking/text defaults: `ECHO_CHUNKING` (default `1`), `ECHO_CHUNK_CHARS_PER_SECOND` (default `14`), `ECHO_CHUNK_WORDS_PER_SECOND` (default `2.7`).
+- Reference audio handling: `ECHO_MAX_SPEAKER_LATENT_LENGTH` (default `6400`), `ECHO_FOLDER_SUPPORT` (default `1` to allow folder prompts), `ECHO_WARMUP_VOICE` and `ECHO_WARMUP_TEXT` seed optional compile warmup.
+- Note: enabling `torch.compile` (model and/or decoder) can increase peak VRAM; disable `ECHO_COMPILE`/`ECHO_COMPILE_AE` if memory is tight.
+
+# Original README
+
 A multi-speaker text-to-speech model with speaker reference conditioning. See the [blog post](https://jordandarefsky.com/blog/2025/echo/) for technical details.
 
 **Model:** [jordand/echo-tts-base](https://huggingface.co/jordand/echo-tts-base) | **Demo:** [echo-tts-preview](https://huggingface.co/spaces/jordand/echo-tts-preview)

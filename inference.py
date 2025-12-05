@@ -1,3 +1,4 @@
+import gc
 from dataclasses import dataclass
 from typing import Callable, List, Tuple
 
@@ -10,19 +11,110 @@ from torchcodec.decoders import AudioDecoder
 from autoencoder import DAC, build_ae
 from model import EchoDiT
 
-def load_model_from_hf(repo_id: str = "jordand/echo-tts-base", device: str = "cuda", dtype: torch.dtype | None = torch.bfloat16, compile: bool = False, token: str | None = None, delete_blockwise_modules: bool = False) -> EchoDiT:
-    with torch.device("meta"):
-        model = EchoDiT(
-            latent_size=80, model_size=2048, num_layers=24, num_heads=16,
-            intermediate_size=5888, norm_eps=1e-5,
-            text_vocab_size=256, text_model_size=1280, text_num_layers=14,
-            text_num_heads=10, text_intermediate_size=3328,
-            speaker_patch_size=4, speaker_model_size=1280, speaker_num_layers=14,
-            speaker_num_heads=10, speaker_intermediate_size=3328,
-            timestep_embed_size=512, adaln_rank=256,
-        )
-    w_path = hf_hub_download(repo_id, "pytorch_model.safetensors", token=token)
-    state = st.load_file(w_path, device="cpu")
+
+LORA_ALPHA = 32.0
+
+
+def merge_lora_into_state_dict(
+    base_state: dict[str, torch.Tensor],
+    lora_state: dict[str, torch.Tensor],
+    lora_scale: float = 1.0,   # extra user scale on top of training scale
+    alpha: float = LORA_ALPHA, # should match training (32.0 in your JAX LoRA)
+) -> dict[str, torch.Tensor]:
+    """
+    Merge LoRA weights (produced by flax_lora_to_torch) into a base state_dict.
+
+    Expects LoRA keys like:
+      "<prefix>.lora_w1.weight"  (shape: [r, in])
+      "<prefix>.lora_w2.weight"  (shape: [out, r])
+
+    and base weights like:
+      "<prefix>.weight"          (shape: [out, in])
+
+    The merged update is:
+      W_new = W + (alpha / r) * lora_scale * (lora_w2 @ lora_w1)
+    """
+    base_state = dict(base_state)  # work on a copy so we don't mutate the original
+
+    for k in list(lora_state.keys()):
+        if not k.endswith(".lora_w1.weight"):
+            continue
+
+        prefix = k[: -len(".lora_w1.weight")]
+        w1_key = prefix + ".lora_w1.weight"
+        w2_key = prefix + ".lora_w2.weight"
+        base_key = prefix + ".weight"
+
+        if w2_key not in lora_state:
+            print(f"[LoRA] Missing {w2_key}, skipping {prefix}")
+            continue
+
+        if base_key not in base_state:
+            continue
+
+        w1 = lora_state[w1_key]  # (r, in)
+        w2 = lora_state[w2_key]  # (out, r)
+        W = base_state[base_key]  # (out, in)
+
+        if w1.ndim != 2 or w2.ndim != 2 or W.ndim != 2:
+            print(f"[LoRA] Unexpected tensor rank for {prefix}, skipping")
+            continue
+
+        r, in_dim = w1.shape
+        out_dim, r2 = w2.shape
+
+        if r2 != r:
+            print(f"[LoRA] Rank mismatch for {prefix}: w1 {w1.shape}, w2 {w2.shape}, skipping")
+            continue
+
+        if W.shape != (out_dim, in_dim):
+            print(f"[LoRA] Shape mismatch for {prefix}: base {W.shape}, expected {(out_dim, in_dim)}, skipping")
+            continue
+
+        scale = (alpha / float(r)) * float(lora_scale)
+        delta = (w2.float() @ w1.float()) * scale  # (out, in)
+
+        base_state[base_key] = (W.float() + delta).to(W.dtype)
+
+    return base_state
+
+
+def load_model_from_hf(
+    repo_id: str = "jordand/echo-tts-base",
+    device: str = "cuda",
+    dtype: torch.dtype | None = torch.bfloat16,
+    compile: bool = False,
+    token: str | None = None,
+    delete_blockwise_modules: bool = False,
+    lora_hf_hub_name: str | None = None,
+    lora_scale: float = 1.0,
+    lora_alpha: float = LORA_ALPHA,
+    base_state_dict: dict[str, torch.Tensor] | None = None,
+) -> EchoDiT:
+    if lora_hf_hub_name is not None and lora_hf_hub_name.lower() == "none":
+        lora_hf_hub_name = None
+
+    model = EchoDiT(
+        latent_size=80, model_size=2048, num_layers=24, num_heads=16,
+        intermediate_size=5888, norm_eps=1e-5,
+        text_vocab_size=256, text_model_size=1280, text_num_layers=14,
+        text_num_heads=10, text_intermediate_size=3328,
+        speaker_patch_size=4, speaker_model_size=1280, speaker_num_layers=14,
+        speaker_num_heads=10, speaker_intermediate_size=3328,
+        timestep_embed_size=512, adaln_rank=256,
+    )
+    if base_state_dict is None:
+        w_path = hf_hub_download(repo_id, "pytorch_model.safetensors", token=token)
+        # Load straight to target device to avoid large CPU copies.
+        state = st.load_file(w_path, device=device)
+        if dtype is not None:
+            state = {k: v.to(dtype=dtype, device=device) for k, v in state.items()}
+    else:
+        # Reuse an already-loaded base state; move directly to target device/dtype.
+        state = {
+            k: v.to(device=device, dtype=(dtype or v.dtype))
+            for k, v in base_state_dict.items()
+        }
 
     if delete_blockwise_modules:
         state = {k: v for k, v in state.items() if not (
@@ -32,13 +124,24 @@ def load_model_from_hf(repo_id: str = "jordand/echo-tts-base", device: str = "cu
             ".wv_latent" in k
         )}
 
-    if dtype is not None:
-        state = {k: v.to(dtype=dtype) for k, v in state.items()}
-    
-    state = {k: v.to(device=device) for k, v in state.items()}
-    
+    if lora_hf_hub_name is not None:
+        lora_path = hf_hub_download(repo_id, lora_hf_hub_name, token=token)
+        # Load LoRA weights directly on device to avoid host copies.
+        lora_state = st.load_file(lora_path, device=device)
+        state = merge_lora_into_state_dict(
+            base_state=state,
+            lora_state=lora_state,
+            lora_scale=lora_scale,
+            alpha=lora_alpha,
+        )
+        del lora_state
+        gc.collect()
+
     model.load_state_dict(state, strict=False, assign=True)
-    model = model.eval()
+    model = model.to(device).eval()
+    # Free CPU copies promptly; state dicts can be large.
+    del state
+    gc.collect()
 
     if compile:
         model = compile_model(model)
@@ -49,7 +152,8 @@ def compile_model(model: EchoDiT) -> EchoDiT:
     model = torch.compile(model)
     model.get_kv_cache_text = torch.compile(model.get_kv_cache_text)
     model.get_kv_cache_speaker = torch.compile(model.get_kv_cache_speaker)
-    model.get_kv_cache_latent = torch.compile(model.get_kv_cache_latent)
+    if hasattr(model, "get_kv_cache_latent"):
+        model.get_kv_cache_latent = torch.compile(model.get_kv_cache_latent)
     return model
 
 def load_fish_ae_from_hf(repo_id: str = "jordand/fish-s1-dac-min", device: str = "cuda", dtype: torch.dtype | None = torch.float32, compile: bool = False, token: str | None = None) -> DAC:
@@ -58,16 +162,14 @@ def load_fish_ae_from_hf(repo_id: str = "jordand/fish-s1-dac-min", device: str =
         fish_ae = build_ae()
 
     w_path = hf_hub_download(repo_id, "pytorch_model.safetensors", token=token)
+    state = st.load_file(w_path, device=device)
     if dtype is not None and dtype != torch.float32:
-        state = st.load_file(w_path, device="cpu")
-        state = {k: v.to(dtype=dtype) for k, v in state.items()}
-        state = {k: v.to(device=device) for k, v in state.items()}
-        fish_ae.load_state_dict(state, strict=False, assign=True)
-    else:
-        state = st.load_file(w_path, device=device)
-        fish_ae.load_state_dict(state, strict=False, assign=True)
+        state = {k: v.to(dtype=dtype, device=device) for k, v in state.items()}
+    fish_ae.load_state_dict(state, strict=False, assign=True)
+    del state
 
     fish_ae = fish_ae.eval().to(device)
+    gc.collect()
 
     if compile:
         fish_ae = compile_fish_ae(fish_ae)
@@ -121,7 +223,6 @@ def tokenizer_encode(text: str, append_bos: bool = True, normalize: bool = True,
         text = text.replace("\n", " ")
         text = text.replace(":", ",")
         text = text.replace(";", ",")
-        text = text.replace("—", ", ")
         if not text.startswith("[") and not text.startswith("(") and 'S1' not in text and 'S2' not in text:
             text = "[S1] " + text
 
@@ -188,8 +289,7 @@ def get_speaker_latent_and_mask(
     audio: torch.Tensor, # (1, length)
     max_speaker_latent_length: int = 6400, # pretrained max length
     audio_chunk_size: int = 640 * 2048, # (~30 seconds, 1/10 max speaker condition size; max chunk seen in training)
-    pad_to_max: bool = False,
-    divis_by_patch_size: int | None = 4,
+    pad_to_max: bool = False
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     # gets speaker latent and mask from audio, computes in chunks and concatenates (similar to training setup)
     
@@ -220,10 +320,6 @@ def get_speaker_latent_and_mask(
     elif not pad_to_max:
         speaker_latent = speaker_latent[:, :actual_latent_length]
         speaker_mask = speaker_mask[:, :actual_latent_length]
-
-    if divis_by_patch_size is not None:
-        speaker_latent = speaker_latent[:, :speaker_latent.shape[1] // divis_by_patch_size * divis_by_patch_size]
-        speaker_mask = speaker_mask[:, :speaker_mask.shape[1] // divis_by_patch_size * divis_by_patch_size]
     
     return speaker_latent, speaker_mask
 
@@ -231,19 +327,32 @@ def get_speaker_latent_and_mask(
 # ________
 
 def find_flattening_point(data, target_value=0.0, window_size=20, std_threshold=0.05):
-    # simple heuristic to find end of latent generations; slow and can be improved
-    # (data is (length, 80))
-    padded_data = torch.cat([data, torch.zeros(window_size, *data.shape[1:], device=data.device, dtype=data.dtype)])
-    for i in range(len(padded_data) - window_size):
-        window = padded_data[i:i + window_size]
-        if window.std() < std_threshold and abs(window.mean() - target_value) < 0.1:
-            return i
-    return len(data)
+    """
+    Heuristic to find the start of the flat (near-zero) tail of the latent sequence.
+    Scans backward from the end, requiring consecutive flat windows.
+    """
+    if data.numel() == 0:
+        return 0
 
-def crop_audio_to_flattening_point(audio: torch.Tensor, latent: torch.Tensor) -> torch.Tensor:
-    # (audio is (..., length), latent is (length, 80))
-    flattening_point = find_flattening_point(latent)
-    return audio[..., :flattening_point * 2048]
+    mean_abs_threshold = 0.02
+    max_abs_threshold = 0.05
+    min_runs = 2  # require this many consecutive flat windows
+
+    flat_start = len(data)
+    runs = 0
+    for i in range(len(data) - window_size, -1, -1):
+        window = data[i : i + window_size]
+        std_ok = window.std() < std_threshold
+        mean_ok = (window - target_value).abs().mean() < mean_abs_threshold
+        max_ok = window.abs().max() < max_abs_threshold
+        if std_ok and mean_ok and max_ok:
+            runs += 1
+            if runs >= min_runs:
+                flat_start = i
+        else:
+            if runs > 0:
+                break
+    return flat_start
 
 SampleFn = Callable[
     [EchoDiT, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int],
@@ -282,12 +391,16 @@ def sample_pipeline(
             max_speaker_latent_length=pad_to_max_speaker_latent_length or MAX_SPEAKER_LATENT_LENGTH,
             pad_to_max=(pad_to_max_speaker_latent_length is not None)
         )
+        speaker_latent = speaker_latent[:, :speaker_latent.shape[1] // 4 * 4] # have to be divis by patch size
+        speaker_mask = speaker_mask[:, :speaker_mask.shape[1] // 4 * 4]
 
+        
     latent_out = sample_fn(model, speaker_latent, speaker_mask, text_input_ids, text_mask, rng_seed)
 
     audio_out = ae_decode(fish_ae, pca_state, latent_out)
 
-    audio_out = crop_audio_to_flattening_point(audio_out, latent_out[0])
+    flattening_point = find_flattening_point(latent_out[0])
+    audio_out = audio_out[..., :flattening_point * 2048]
 
     return audio_out, normalized_text[0]
 
@@ -353,12 +466,12 @@ def sample_euler_cfg_independent_guidances(
     if sequence_length is None:
         sequence_length = 640 # max sequence length during training
 
+    torch.manual_seed(rng_seed)
+
     INIT_SCALE = 0.999 # so that we can apply rescale to first step
 
     device, dtype = model.device, model.dtype
     batch_size = text_input_ids.shape[0]
-
-    rng = torch.Generator(device=device).manual_seed(rng_seed)
 
     t_schedule = torch.linspace(1., 0., num_steps + 1, device=device) * INIT_SCALE
 
@@ -378,7 +491,7 @@ def sample_euler_cfg_independent_guidances(
     full_text_mask = torch.cat([text_mask, text_mask_uncond, text_mask], dim=0)
     full_speaker_mask = torch.cat([speaker_mask, speaker_mask, speaker_mask_uncond], dim=0)
 
-    x_t = torch.randn((batch_size, sequence_length, 80), device=device, dtype=torch.float32, generator=rng)
+    x_t = torch.randn((batch_size, sequence_length, 80), device=device, dtype=torch.float32)
     if truncation_factor is not None:
         x_t = x_t * truncation_factor
 
@@ -421,42 +534,5 @@ def sample_euler_cfg_independent_guidances(
     return x_t
 
 
-
-# ___________________________________________________________
-# simple example
-
 if __name__ == "__main__":
     model = load_model_from_hf(delete_blockwise_modules=True)
-    fish_ae = load_fish_ae_from_hf()
-    pca_state = load_pca_state_from_hf()
-
-    speaker_audio_path = "/path/to/speaker/audio.wav"
-    speaker_audio = load_audio(speaker_audio_path).cuda()
-    speaker_latent, speaker_mask = get_speaker_latent_and_mask(fish_ae, pca_state, speaker_audio)
-
-    text = "[S1] Alright, I'm going to demo this new model called Echo TTS. Hopefully this works, I'm super excited to try this and see what it can do."
-    text_input_ids, text_mask = get_text_input_ids_and_mask([text], max_length=None, device="cuda")
-
-    latent_out = sample_euler_cfg_independent_guidances(
-        model=model,
-        speaker_latent=speaker_latent,
-        speaker_mask=speaker_mask,
-        text_input_ids=text_input_ids,
-        text_mask=text_mask,
-        rng_seed=0,
-        num_steps=40,
-        cfg_scale_text=3.0,
-        cfg_scale_speaker=8.0,
-        cfg_min_t=0.5,
-        cfg_max_t=1.0,
-        truncation_factor=0.8,
-        rescale_k=None,
-        rescale_sigma=None,
-        speaker_kv_scale=None,
-        speaker_kv_max_layers=None,
-        speaker_kv_min_t=None,
-        sequence_length=640, # (max 640. shorter lengths will generate prefixes, not necessarily full generations)
-    )
-    audio_out = ae_decode(fish_ae, pca_state, latent_out)
-    audio_out = crop_audio_to_flattening_point(audio_out, latent_out[0])
-    torchaudio.save("output.wav", audio_out[0].cpu(), 44100)
