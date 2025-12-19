@@ -7,3 +7,5 @@ venv/
 .idea/
 .vscode/
 api_generation.wav
+/audio_prompts
+temp_gradio_audio/

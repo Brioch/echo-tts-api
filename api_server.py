@@ -7,6 +7,7 @@ import io
 import wave
 import shutil
 import subprocess
+import asyncio
 from dataclasses import dataclass, replace
 from contextlib import asynccontextmanager
 from functools import partial
@@ -866,6 +867,27 @@ def _audio_to_pcm(audio: torch.Tensor) -> bytes:
     return (audio * 32767.0).to(torch.int16).numpy().tobytes()
 
 
+def _get_wav_header(sample_rate: int = SAMPLE_RATE, channels: int = 1, bits_per_sample: int = 16) -> bytes:
+    """Returns a WAV header for streaming. Data size is set to max to support streaming."""
+    byte_rate = sample_rate * channels * bits_per_sample // 8
+    block_align = channels * bits_per_sample // 8
+
+    header = b'RIFF'
+    header += (0xFFFFFFFF).to_bytes(4, 'little')  # ChunkSize (indefinite)
+    header += b'WAVE'
+    header += b'fmt '
+    header += (16).to_bytes(4, 'little')  # Subchunk1Size for PCM
+    header += (1).to_bytes(2, 'little')  # AudioFormat (1 for PCM)
+    header += channels.to_bytes(2, 'little')
+    header += sample_rate.to_bytes(4, 'little')
+    header += byte_rate.to_bytes(4, 'little')
+    header += block_align.to_bytes(2, 'little')
+    header += bits_per_sample.to_bytes(2, 'little')
+    header += b'data'
+    header += (0xFFFFFFFF).to_bytes(4, 'little')  # Subchunk2Size (indefinite)
+    return header
+
+
 def _pcm16_to_wav_bytes(pcm: bytes, sample_rate: int) -> bytes:
     """Wrap little-endian 16-bit PCM into a WAV container."""
     with io.BytesIO() as buffer:
@@ -1560,12 +1582,10 @@ def _resolve_response_format(requested: Optional[str], stream: bool) -> str:
     if requested is None or str(requested).strip() == "":
         return "pcm" if stream else ("mp3" if FFMPEG_PATH else "wav")
     fmt = str(requested).strip().lower()
-    allowed = {"pcm"} if stream else {"pcm", "wav", "mp3"}
+    allowed = {"pcm", "wav", "mp3"}
     if fmt not in allowed:
         raise HTTPException(status_code=400, detail="response_format must be one of 'pcm', 'wav', 'mp3'")
-    if stream and fmt != "pcm":
-        raise HTTPException(status_code=400, detail="Streaming currently supports response_format='pcm' only")
-    if (not stream) and fmt == "mp3" and not FFMPEG_PATH:
+    if fmt == "mp3" and not FFMPEG_PATH:
         raise HTTPException(status_code=400, detail="response_format='mp3' requires ffmpeg in PATH")
     return fmt
 
@@ -1583,6 +1603,61 @@ def list_voices() -> Dict[str, Any]:
     """
     voices = _list_voice_options()
     return {"object": "list", "data": voices}
+
+
+async def _stream_pcm_to_mp3(pcm_iterator: AsyncIterator[bytes], sample_rate: int) -> AsyncIterator[bytes]:
+    """
+    Stream PCM audio chunks and encode them to MP3 using ffmpeg.
+    """
+    if not FFMPEG_PATH:
+        # This should be caught earlier, but as a safeguard.
+        raise HTTPException(
+            status_code=500,
+            detail="response_format='mp3' requires ffmpeg in PATH",
+        )
+
+    ffmpeg_proc = await asyncio.create_subprocess_exec(
+        FFMPEG_PATH,
+        "-v", "error",
+        "-f", "s16le",
+        "-ar", str(sample_rate),
+        "-ac", "1",
+        "-i", "-",
+        "-f", "mp3",
+        "-",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    async def writer():
+        try:
+            async for pcm_chunk in pcm_iterator:
+                if ffmpeg_proc.stdin and not ffmpeg_proc.stdin.is_closing():
+                    ffmpeg_proc.stdin.write(pcm_chunk)
+                    await ffmpeg_proc.stdin.drain()
+        except Exception as e:
+            _log_debug(f"Error writing to ffmpeg stdin: {e}")
+        finally:
+            if ffmpeg_proc.stdin and not ffmpeg_proc.stdin.is_closing():
+                ffmpeg_proc.stdin.close()
+
+    writer_task = asyncio.create_task(writer())
+
+    while True:
+        if ffmpeg_proc.stdout:
+            mp3_chunk = await ffmpeg_proc.stdout.read(4096)
+            if not mp3_chunk:
+                break
+            yield mp3_chunk
+    
+    await writer_task
+    return_code = await ffmpeg_proc.wait()
+
+    if return_code != 0:
+        err_bytes = await ffmpeg_proc.stderr.read()
+        err = err_bytes.decode(errors="ignore").strip()
+        _log_debug(f"[mp3] ffmpeg stream encode error rc={return_code} stderr={err}")
 
 
 @app.post("/v1/audio/speech")
@@ -1686,7 +1761,7 @@ def create_speech(request: Request, payload: SpeechRequest = Body(...)) -> Strea
             except Exception:
                 pass
 
-        async def _generator() -> AsyncIterator[bytes]:
+        async def _pcm_generator() -> AsyncIterator[bytes]:
             emitted = False
             _log_debug(f"[route] generator entered: {(time.time() - route_start)*1000:.2f} ms")
 
@@ -1717,10 +1792,28 @@ def create_speech(request: Request, payload: SpeechRequest = Body(...)) -> Strea
                         raise
             finally:
                 _close_iter(stream_iter)
+        
+        content_iterator: AsyncIterator[bytes]
+        media_type: str
+
+        if response_format == 'wav':
+            async def _wav_stream_generator() -> AsyncIterator[bytes]:
+                yield _get_wav_header()
+                async for pcm_chunk in _pcm_generator():
+                    yield pcm_chunk
+            content_iterator = _wav_stream_generator()
+            media_type = 'audio/wav'
+        elif response_format == 'mp3':
+            content_iterator = _stream_pcm_to_mp3(_pcm_generator(), SAMPLE_RATE)
+            media_type = 'audio/mpeg'
+        else:  # pcm
+            content_iterator = _pcm_generator()
+            media_type = "application/octet-stream"
+
 
         response = StreamingResponse(
-            _generator(),
-            media_type="application/octet-stream",
+            content_iterator,
+            media_type=media_type,
             headers={"X-Audio-Sample-Rate": str(SAMPLE_RATE)},
         )
         _log_debug(
